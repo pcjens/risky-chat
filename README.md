@@ -25,7 +25,7 @@ is a really fun programming language to use.
 Requirements: a C compiler and a POSIX.1-2001 compliant system
 (e.g. Linux).
 
-Just compile [riskychat.c][riskychat.c] into an executable. Basic
+Just compile [riskychat.c](riskychat.c) into an executable. Basic
 example:
 
 ```
@@ -46,17 +46,6 @@ For development, I use the following incantation:
 musl-gcc -static -std=c89 -Wall -Werror -Wpedantic -O3 -o riskychat riskychat.c
 ./riskychat
 ```
-
-## Prebuilt binaries
-
-There's a pre-built standalone binary for x86\_64 Linux systems in the
-[builds](builds/) directory. It's a statically linked executable, so
-it should run on any Linux system running on an x86\_64 processor.
-
-### Why keep binaries in the source tree?
-
-Because they're only a few tens of kilobytes. One of the rare joys of
-C programming.
 
 ## License
 
