@@ -43,7 +43,7 @@ tcc -run riskychat.c
 For development, I use the following incantation:
 
 ```
-musl-gcc -static -std=c89 -Wall -Werror -Wpedantic -O3 -o riskychat riskychat.c
+musl-gcc -static -std=c89 -Wall -Werror -Wpedantic -fanalyzer -O3 -o riskychat riskychat.c
 ./riskychat
 ```
 
