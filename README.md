@@ -28,23 +28,39 @@ Requirements: a C compiler and a POSIX.1-2001 compliant system
 Just compile [riskychat.c](riskychat.c) into an executable. Basic
 example:
 
-```
+```shell
+# Build with cc:
 cc -o riskychat riskychat.c
+# Run:
 ./riskychat
 ```
 
 Risky Chat also compiles with TCC, so you can run it like a script if
 you have [tcc][tcc]:
 
-```
+```shell
+# Compile and run (doesn't leave an executable lying around):
 tcc -run riskychat.c
 ```
 
 For development, I use the following incantation:
 
-```
+```shell
+# Enable a lot of warnings and whatever static analysis is available, and create a static binary.
+# Runs on Arch Linux with the community/musl package. Build:
 musl-gcc -static -std=c89 -Wall -Werror -Wpedantic -fanalyzer -O3 -o riskychat riskychat.c
+# Run:
 ./riskychat
+```
+
+Finally, compiling for Windows works too, simply run the following in
+a Developer Command Prompt (from a Visual Studio installation):
+
+```batchfile
+# Build:
+cl.exe /Feriskychat riskychat.c
+# Run:
+riskychat.exe
 ```
 
 ## License

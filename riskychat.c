@@ -27,23 +27,33 @@
 #define _POSIX_C_SOURCE 200112L
 #include "config.h"
 
-/* TODO: Add winsock in here somewhere for Windows support.
- * Let's hope that's enough for this to compile on there. Thanks, Bill! */
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netinet/in.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+/* ssize_t: */
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+/* Sockets: */
+#include <winsock2.h>
+#define SHUT_RDWR SD_BOTH
+#define close closesocket
+#pragma comment(lib, "Ws2_32.lib")
+#else
+/* Sockets: */
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+/* Signals: */
+#include <signal.h>
+#define SOCKET_ERROR (-1)
+#define INVALID_SOCKET (-1)
+#endif
 
 /* decls: Declarations used by the rest of the program. */
-
-enum riskychat_error {
-    NO_ERROR, SOCKET_CREATION, SOCKET_BINDING, SOCKET_LISTENING
-};
 
 enum http_method {
     GET, POST /* Just the ones we care about. */
@@ -53,10 +63,11 @@ enum resource {
     UNKNOWN_RESOURCE, RESOURCE_INDEX, RESOURCE_NEW_POST
 };
 
-void print_err(enum riskychat_error err);
-void connect_socket(enum riskychat_error *err, int *socket_fd);
+int connect_socket(void);
 void handle_connection(int connect_fd);
+#ifndef _WIN32
 void handle_terminate(int sig);
+#endif
 void printf_clear_line(void);
 
 
@@ -64,17 +75,30 @@ void printf_clear_line(void);
 
 static int SERVER_TERMINATED = 0;
 int main(void) {
-    enum riskychat_error err;
     int socket_fd, connect_fd;
+#ifndef _WIN32
     struct sigaction sa;
+#endif
+
+#ifdef _WIN32
+    WSADATA wsaData;
+    int result;
+
+    result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        printf("WSAStartup failed: %d\n", result);
+        return 1;
+    }
+#endif
 
     /* Creation of the TCP socket we will listen to HTTP connections on. */
-    connect_socket(&err, &socket_fd);
-    if (err != NO_ERROR) { print_err(err); return 1; }
-    printf("Started the Risky Chat server on %s:%d.\n",
+    socket_fd = connect_socket();
+    if (socket_fd == -1) { return 1; }
+    printf("Started the Risky Chat server on http://%s:%d.\n",
            RISKYCHAT_HOST, RISKYCHAT_PORT);
 
     /* Setup interrupt handler. */
+#ifndef _WIN32
     sa.sa_handler = handle_terminate;
     sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask);
@@ -86,12 +110,13 @@ int main(void) {
     if (sigaction(SIGTERM, &sa, NULL) == -1) {
         perror("could not set up a handle for SIGTERM");
     }
+#endif
 
     /* The main listening loop. */
     for (;;) {
         connect_fd = accept(socket_fd, NULL, NULL);
         if (SERVER_TERMINATED) break;
-        if (connect_fd == -1) {
+        if (connect_fd == INVALID_SOCKET) {
             perror("could not accept on the socket");
             break;
         }
@@ -100,6 +125,9 @@ int main(void) {
 
     /* Resource cleanup. */
     close(socket_fd);
+#ifdef _WIN32
+    WSACleanup();
+#endif
     printf_clear_line();
     printf("\rGood night!\n");
 
@@ -169,7 +197,7 @@ ssize_t read_line(int fd, char **buffer, ssize_t *buffer_len) {
             }
         }
 
-        read_bytes = read(fd, &(*buffer)[string_len], 1);
+        read_bytes = recv(fd, &(*buffer)[string_len], 1, 0);
         if (read_bytes == 0) {
             break;
         } else if (read_bytes == -1) {
@@ -202,21 +230,21 @@ ssize_t write_http_response(int fd, char *status, size_t status_len,
     char buf[64];
     int buf_len;
 
-    written_len = write(fd, http_response_head, sizeof http_response_head);
+    written_len = send(fd, http_response_head, sizeof http_response_head, 0);
     if (written_len == -1) return -1;
     else total_len += written_len;
 
-    written_len = write(fd, status, status_len);
+    written_len = send(fd, status, status_len, 0);
     if (written_len == -1) return -1;
     else total_len += written_len;
 
     buf_len = snprintf(buf, sizeof buf, "\r\nContent-Length: %d\r\n\r\n",
                        response_len);
-    written_len = write(fd, buf, buf_len);
+    written_len = send(fd, buf, buf_len, 0);
     if (written_len == -1) return -1;
     else total_len += written_len;
 
-    written_len = write(fd, response, response_len);
+    written_len = send(fd, response, response_len, 0);
     if (written_len == -1) return -1;
     else total_len += written_len;
 
@@ -226,43 +254,31 @@ ssize_t write_http_response(int fd, char *status, size_t status_len,
 
 /* pubfuncs: Functions used in main(). */
 
-void print_err(enum riskychat_error err) {
-    switch (err) {
-    case SOCKET_CREATION:
-        perror("tcp socket creation failed");
-        break;
-    case SOCKET_BINDING:
-        perror("binding to the address failed");
-        break;
-    case SOCKET_LISTENING:
-        perror("listening to the socket failed");
-        break;
-    case NO_ERROR:
-    default:
-        break;
-    }
-}
-
-void connect_socket(enum riskychat_error *err, int *socket_fd) {
+int connect_socket(void) {
     int fd;
     struct sockaddr_in sa;
 
     fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (fd == -1) { *err = SOCKET_CREATION; return; }
+    if (fd == INVALID_SOCKET) {
+        perror("tcp socket creation failed");
+        return -1;
+    }
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
     sa.sin_port = htons(RISKYCHAT_PORT);
     sa.sin_addr.s_addr = inet_addr(RISKYCHAT_HOST);
-    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) == -1) {
-        *err = SOCKET_BINDING;
-        return;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) == SOCKET_ERROR) {
+        perror("binding to the address failed");
+        return -1;
     }
 
-    if (listen(fd, SOMAXCONN) == -1) { *err = SOCKET_LISTENING; return; }
+    if (listen(fd, SOMAXCONN) == SOCKET_ERROR) {
+        perror("listening to the socket failed");
+        return -1;
+    }
 
-    *err = NO_ERROR;
-    *socket_fd = fd;
+    return fd;
 }
 
 /* TODO: Refactor this to work in a polling style. */
@@ -326,7 +342,7 @@ void handle_connection(int connect_fd) {
         }
         read_len = 0;
         while (read_len < expected_content_length) {
-            read_len += read(connect_fd, &buffer[read_len], expected_content_length);
+            read_len += recv(connect_fd, &buffer[read_len], expected_content_length, 0);
             if (read_len == -1) {
                 perror("error while reading body");
                 goto respond_400;
@@ -337,8 +353,8 @@ void handle_connection(int connect_fd) {
             printf("\b\b(%d bytes read) ", expected_content_length);
 
         if (requested_resource == RESOURCE_NEW_POST) {
-            written_len = write(connect_fd, static_post_response_raw,
-                                sizeof static_post_response_raw - 1);
+            written_len = send(connect_fd, static_post_response_raw,
+                               sizeof static_post_response_raw - 1, 0);
             if (written_len == -1) perror("error when writing post ok");
             if (RISKYCHAT_VERBOSE >= 1) printf("<- post handled\n");
             goto cleanup;
@@ -387,11 +403,13 @@ cleanup:
     close(connect_fd);
 }
 
+#ifndef _WIN32
 void handle_terminate(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
         SERVER_TERMINATED = 1;
     }
 }
+#endif
 
 void printf_clear_line(void) {
     /* See "Clear entire line" here (it's a VT100 escape code):
