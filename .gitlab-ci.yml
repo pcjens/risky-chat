@@ -1,5 +1,6 @@
 image: alpine:latest
-script:
-  - cc -o riskychat -static -O2 riskychat.c
-artifacts:
-  - riskychat
+job:
+  script:
+    - cc -o riskychat -static -O2 riskychat.c
+  artifacts:
+    - riskychat
