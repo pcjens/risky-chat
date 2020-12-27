@@ -25,7 +25,9 @@
  */
 
 #define _POSIX_C_SOURCE 200112L
-#include "config.h"
+const char *RISKYCHAT_HOST = "127.0.0.1";
+const short RISKYCHAT_PORT = 8000;
+const int RISKYCHAT_VERBOSE = 1;
 
 #include <errno.h>
 #include <stdio.h>
@@ -63,8 +65,21 @@ enum resource {
     UNKNOWN_RESOURCE, RESOURCE_INDEX, RESOURCE_NEW_POST
 };
 
+struct connection_ctx {
+    int connect_fd;
+    char *buffer;
+    size_t buffer_len;
+    size_t read_len;
+    size_t written_len;
+    int stage;
+    enum http_method method;
+    enum resource requested_resource;
+    size_t expected_content_length;
+};
+
 int connect_socket(void);
-void handle_connection(int connect_fd);
+int handle_connection(struct connection_ctx *ctx);
+void cleanup_connection(struct connection_ctx *ctx);
 #ifndef _WIN32
 void handle_terminate(int sig);
 #endif
@@ -75,14 +90,15 @@ void printf_clear_line(void);
 
 static int SERVER_TERMINATED = 0;
 int main(void) {
-    int socket_fd, connect_fd;
+    int result, socket_fd, connect_fd;
+    struct connection_ctx ctx;
+
 #ifndef _WIN32
     struct sigaction sa;
 #endif
 
 #ifdef _WIN32
     WSADATA wsaData;
-    int result;
 
     result = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (result != 0) {
@@ -97,8 +113,8 @@ int main(void) {
     printf("Started the Risky Chat server on http://%s:%d.\n",
            RISKYCHAT_HOST, RISKYCHAT_PORT);
 
-    /* Setup interrupt handler. */
 #ifndef _WIN32
+    /* Setup interrupt handler. */
     sa.sa_handler = handle_terminate;
     sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask);
@@ -116,11 +132,20 @@ int main(void) {
     for (;;) {
         connect_fd = accept(socket_fd, NULL, NULL);
         if (SERVER_TERMINATED) break;
-        if (connect_fd == INVALID_SOCKET) {
-            perror("could not accept on the socket");
-            break;
+        if (connect_fd != INVALID_SOCKET) {
+            memset(&ctx, 0, sizeof ctx);
+            ctx.connect_fd = connect_fd;
+            for (;;) {
+                result = handle_connection(&ctx);
+                if (result == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    perror("error while handling connection");
+                    cleanup_connection(&ctx);
+                    break;
+                } else if (result == 0) {
+                    break;
+                }
+            }
         }
-        handle_connection(connect_fd);
     }
 
     /* Resource cleanup. */
@@ -139,27 +164,22 @@ int main(void) {
 
 static char static_response_index[] = "\
 <!DOCTYPE html>\r\n\
-<html>\
-<head>\
-<meta charset=\"utf-8\">\
-<title>Risky Chat</title>\
+<html><head><meta charset=\"utf-8\"><title>Risky Chat</title>\
 <style>html{\
-background-color:#EEEEE8; color:#222;\
+background-color:#EEEEE8;color:#222;\
 }\
-chatbox{ display:flex; flex-direction:column-reverse; }\
+chatbox{display:flex;flex-direction:column-reverse;}\
 post{\
-margin:0; padding:4px;\
+margin:0;padding:4px;\
 border-top:2px solid #DDD;\
 }</style>\
-</head>\
-<body>\
+</head><body>\
 <form method=\"POST\" action=\"/post\"\
-  onsubmit=\"submit(); reset(); return false;\">\
+ onsubmit=\"submit(); reset(); return false;\">\
 <input type=\"text\" id=\"content\" name=\"content\" autofocus>\
 <button type=\"submit\">Post</button>\
-</form>\
-<br>\
-<chatbox>";
+</form><br>\
+<chatbox><post>Example post</post></chatbox></body></html>\r\n";
 
 static char static_response_400[] = "\
 400 Bad Request\r\n";
@@ -181,14 +201,13 @@ Content-Length: 0\r\n\
 /* privfuncs: Functions used by the functions used in main(). */
 
 /* Reads from the given file descriptor, until a newline (LF) is encountered.
- * The return value is the line's length, including the LF but not the NUL.
- * If there's nothing more to read, the line length is 0. */
-ssize_t read_line(int fd, char **buffer, ssize_t *buffer_len) {
+ * The return value is 0 if a line was read in entirety, -1 if not.
+ * This should keep getting called until it returns 0 to get the entire line. */
+ssize_t read_line(int fd, char **buffer, size_t *buffer_len, size_t *string_len) {
     ssize_t read_bytes = 0;
-    ssize_t string_len = 0;
 
     for (;;) {
-        if (string_len >= *buffer_len) {
+        if (*string_len >= *buffer_len) {
             *buffer_len += 1024;
             *buffer = realloc(*buffer, *buffer_len);
             if (*buffer == NULL) {
@@ -197,58 +216,79 @@ ssize_t read_line(int fd, char **buffer, ssize_t *buffer_len) {
             }
         }
 
-        read_bytes = recv(fd, &(*buffer)[string_len], 1, 0);
+        read_bytes = recv(fd, &(*buffer)[*string_len], 1, 0);
         if (read_bytes == 0) {
             break;
         } else if (read_bytes == -1) {
-            perror("error while reading from the socket");
-            break;
+            return -1;
         } else {
-            string_len += read_bytes;
-            if ((*buffer)[string_len - 1] == '\n') break;
+            *string_len += read_bytes;
+            if ((*buffer)[*string_len - 1] == '\n') break;
         }
     }
 
     /* Add the null terminator. */
-    if (string_len + 1 > *buffer_len) {
-        *buffer_len = string_len + 1;
+    if (*string_len + 1 > *buffer_len) {
+        *buffer_len = *string_len + 1;
         *buffer = realloc(*buffer, *buffer_len);
         if (*buffer == NULL) {
-            perror("error when stretching line buffer");
+            perror("error when stretching line buffer for the NUL");
             exit(EXIT_FAILURE);
         }
     }
-    (*buffer)[string_len] = '\0';
+    (*buffer)[*string_len] = '\0';
 
-    return string_len;
+    return 0;
 }
 
 static char http_response_head[] = "HTTP/1.1 ";
-ssize_t write_http_response(int fd, char *status, size_t status_len,
+/* Returns 0 when the entire response has been sent. */
+ssize_t write_http_response(int fd, size_t *written_len,
+                            char *status, size_t status_len,
                             char *response, size_t response_len) {
-    ssize_t written_len = 0, total_len = 0;
+    ssize_t result, target_len, section_start;
     char buf[64];
     int buf_len;
 
-    written_len = send(fd, http_response_head, sizeof http_response_head, 0);
-    if (written_len == -1) return -1;
-    else total_len += written_len;
+    section_start = 0;
+    target_len = sizeof http_response_head - 1;
+    while (*written_len < target_len) {
+        result = send(fd, &http_response_head[*written_len - section_start],
+                      target_len - *written_len, 0);
+        if (result == -1) return -1;
+        else *written_len += result;
+    }
 
-    written_len = send(fd, status, status_len, 0);
-    if (written_len == -1) return -1;
-    else total_len += written_len;
+    section_start = target_len;
+    target_len += status_len;
+    while (*written_len < target_len) {
+        result = send(fd, &status[*written_len - section_start],
+                      target_len - *written_len, 0);
+        if (result == -1) return -1;
+        else *written_len += result;
+    }
 
     buf_len = snprintf(buf, sizeof buf, "\r\nContent-Length: %d\r\n\r\n",
                        response_len);
-    written_len = send(fd, buf, buf_len, 0);
-    if (written_len == -1) return -1;
-    else total_len += written_len;
+    section_start = target_len;
+    target_len += buf_len;
+    while (*written_len < target_len) {
+        result = send(fd, &buf[*written_len - section_start],
+                      target_len - *written_len, 0);
+        if (result == -1) return -1;
+        else *written_len += result;
+    }
 
-    written_len = send(fd, response, response_len, 0);
-    if (written_len == -1) return -1;
-    else total_len += written_len;
+    section_start = target_len;
+    target_len += response_len;
+    while (*written_len < target_len) {
+        result = send(fd, &response[*written_len - section_start],
+                      target_len - *written_len, 0);
+        if (result == -1) return -1;
+        else *written_len += result;
+    }
 
-    return total_len;
+    return 0;
 }
 
 
@@ -281,126 +321,162 @@ int connect_socket(void) {
     return fd;
 }
 
-/* TODO: Refactor this to work in a polling style. */
-void handle_connection(int connect_fd) {
-    ssize_t buffer_len = 0, written_len = 0, read_len = 0;
-    int line_length = 0, expected_content_length = -1;
-    char *buffer = NULL, *token;
-    enum http_method method;
-    enum resource requested_resource = UNKNOWN_RESOURCE;
+/* Returns 0 when the connection is closed, -1 otherwise.
+ * This should keep being called if the return value is -1. */
+int handle_connection(struct connection_ctx *ctx) {
+    ssize_t result, total_response_len;
+    char *token;
 
-    /* Read the status line. */
-    line_length = read_line(connect_fd, &buffer, &buffer_len);
-    if (line_length == 0) goto cleanup;
-    token = strtok(buffer, " ");
-    if (strcmp("GET", token) == 0) {
-        method = GET;
-        if (RISKYCHAT_VERBOSE >= 1) printf("GET ");
-    } else if (strcmp("POST", token) == 0) {
-        method = POST;
-        if (RISKYCHAT_VERBOSE >= 1) printf("POST ");
-    } else {
-        if (RISKYCHAT_VERBOSE >= 1) printf("Unknown method: %s\n", token);
-        goto respond_400;
-    }
-    token = strtok(NULL, " ");
-    if (strcmp("/", token) == 0) {
-        requested_resource = RESOURCE_INDEX;
-        if (RISKYCHAT_VERBOSE >= 1) printf("/ ");
-    } else if (strcmp("/post", token) == 0) {
-        requested_resource = RESOURCE_NEW_POST;
-        if (RISKYCHAT_VERBOSE >= 1) printf("/post ");
-    }
+    switch (ctx->stage) {
+    case 0:
+        /* Read the status line. */
+        result = read_line(ctx->connect_fd, &ctx->buffer, &ctx->buffer_len,
+                           &ctx->read_len);
+        if (result == -1) {
+            return -1;
+        }
+        token = strtok(ctx->buffer, " ");
+        if (strcmp("GET", token) == 0) {
+            ctx->method = GET;
+            if (RISKYCHAT_VERBOSE >= 1) printf("GET ");
+        } else if (strcmp("POST", token) == 0) {
+            ctx->method = POST;
+            if (RISKYCHAT_VERBOSE >= 1) printf("POST ");
+        } else {
+            ctx->stage = 3;
+            goto respond_400;
+        }
+        token = strtok(NULL, " ");
+        if (strcmp("/", token) == 0) {
+            ctx->requested_resource = RESOURCE_INDEX;
+            if (RISKYCHAT_VERBOSE >= 1) printf("/ ");
+        } else if (strcmp("/post", token) == 0) {
+            ctx->requested_resource = RESOURCE_NEW_POST;
+            if (RISKYCHAT_VERBOSE >= 1) printf("/post ");
+        }
 
-    /* Read the headers. */
-    for (;;) {
-        line_length = read_line(connect_fd, &buffer, &buffer_len);
-        if (line_length == 0) goto cleanup;
+        /* Reset the line length after processing the statusline. */
+        ctx->read_len = 0;
+        ctx->stage++;
 
-        token = strtok(buffer, ":");
-        if (strcmp("Content-Length", token) == 0) {
-            token = strtok(NULL, ":");
-            expected_content_length = atoi(token);
+    case 1:
+        /* Read the headers. */
+        for (;;) {
+            result = read_line(ctx->connect_fd, &ctx->buffer, &ctx->buffer_len,
+                               &ctx->read_len);
+            if (result == -1) {
+                return -1;
+            }
+
+            token = strtok(ctx->buffer, ":");
+            if (strcmp("Content-Length", token) == 0) {
+                token = strtok(NULL, ":");
+                ctx->expected_content_length = atoi(token);
+                if (RISKYCHAT_VERBOSE >= 1)
+                    printf("(%ld) ", ctx->expected_content_length);
+            }
+
+            /* The end of the header section is marked by an empty line. */
+            if (ctx->read_len == 2 && strcmp("\r\n", ctx->buffer) == 0) {
+                ctx->read_len = 0;
+                break;
+            }
+
+            /* Reset the line length after processing the line. */
+            ctx->read_len = 0;
+        }
+        ctx->stage++;
+
+    case 2:
+        /* Read the body, when needed. */
+        if (ctx->method == POST && ctx->expected_content_length > 0) {
+            if (RISKYCHAT_VERBOSE >= 1) printf("br");
+            if (ctx->buffer_len < ctx->expected_content_length + 1) {
+                ctx->buffer_len = ctx->expected_content_length + 1;
+                ctx->buffer = realloc(ctx->buffer, ctx->buffer_len);
+                if (ctx->buffer == NULL) {
+                    perror("error when allocating buffer for user response");
+                    exit(EXIT_FAILURE);
+                }
+            }
+            ctx->read_len = 0;
+            while (ctx->read_len < ctx->expected_content_length) {
+                result = recv(ctx->connect_fd, &ctx->buffer[ctx->read_len],
+                              ctx->expected_content_length, 0);
+                if (result == -1) return -1;
+                else ctx->read_len += result;
+            }
+            ctx->buffer[ctx->expected_content_length] = '\0';
             if (RISKYCHAT_VERBOSE >= 1)
-                printf("(%d) ", expected_content_length);
+                printf("\b\b(%ld bytes read) ", ctx->expected_content_length);
         }
+        ctx->read_len = 0;
+        ctx->stage++;
 
-        /* The end of the header section is marked by an empty line. */
-        if (line_length == 2 && strcmp("\r\n", buffer) == 0) break;
-    }
-
-    /* Read the body, when needed. */
-    if (method == POST && expected_content_length > 0) {
-        if (RISKYCHAT_VERBOSE >= 1) printf("br");
-        if (buffer_len < expected_content_length + 1) {
-            buffer_len = expected_content_length + 1;
-            buffer = realloc(buffer, buffer_len);
-            if (buffer == NULL) {
-                perror("error when allocating buffer for user response");
-                goto cleanup;
-            }
-        }
-        read_len = 0;
-        while (read_len < expected_content_length) {
-            read_len += recv(connect_fd, &buffer[read_len], expected_content_length, 0);
-            if (read_len == -1) {
-                perror("error while reading body");
-                goto respond_400;
-            }
-        }
-        buffer[expected_content_length] = '\0';
-        if (RISKYCHAT_VERBOSE >= 1)
-            printf("\b\b(%d bytes read) ", expected_content_length);
-
-        if (requested_resource == RESOURCE_NEW_POST) {
-            written_len = send(connect_fd, static_post_response_raw,
-                               sizeof static_post_response_raw - 1, 0);
-            if (written_len == -1) perror("error when writing post ok");
-            if (RISKYCHAT_VERBOSE >= 1) printf("<- post handled\n");
-            goto cleanup;
-        }
-    }
-
-    /* Respond. */
-    if (method == GET) {
-        switch (requested_resource) {
+    case 3:
+        /* Respond. */
+        switch (ctx->requested_resource) {
         case RESOURCE_INDEX:
-            written_len = write_http_response(connect_fd,
-                                              "200 OK", sizeof "200 OK" - 1,
-                                              static_response_index,
-                                              sizeof static_response_index - 1);
-            if (written_len == -1) perror("error when writing index");
-            if (RISKYCHAT_VERBOSE >= 1) printf("<- responded with index\n");
-            goto cleanup;
+            if (ctx->method == GET) goto respond_index;
+            else break;
+        case RESOURCE_NEW_POST:
+            if (ctx->method == POST) goto respond_new_post;
+            else break;
         default:
             goto respond_404;
         }
+        goto respond_400;
     }
 
+respond_new_post:
+    total_response_len = sizeof static_post_response_raw - 1;
+    while (ctx->written_len < total_response_len) {
+        result = send(ctx->connect_fd, static_post_response_raw,
+                      total_response_len - ctx->written_len, 0);
+        if (result == -1) return -1;
+        else ctx->written_len += result;
+    }
+    if (RISKYCHAT_VERBOSE >= 1) printf("<- post handled\n");
+    goto cleanup;
+
+respond_index:
+    result = write_http_response(ctx->connect_fd, &ctx->written_len,
+                                 "200 OK", sizeof "200 OK" - 1,
+                                 static_response_index,
+                                 sizeof static_response_index - 1);
+    if (result == -1) return -1;
+    if (RISKYCHAT_VERBOSE >= 1) printf("<- responded with index\n");
+    goto cleanup;
+
 respond_400:
-    written_len = write_http_response(connect_fd,
-                                      "400 Bad Request",
-                                      sizeof "400 Bad Request" - 1,
-                                      static_response_400,
-                                      sizeof static_response_400 - 1);
-    if (written_len == -1) perror("error when writing error 400 response");
+    result = write_http_response(ctx->connect_fd, &ctx->written_len,
+                                 "400 Bad Request",
+                                 sizeof "400 Bad Request" - 1,
+                                 static_response_400,
+                                 sizeof static_response_400 - 1);
+    if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 1) printf("<- responded with 400\n");
     goto cleanup;
 
 respond_404:
-    written_len = write_http_response(connect_fd,
-                                      "404 Not Found",
-                                      sizeof "404 Not Found" - 1,
-                                      static_response_404,
-                                      sizeof static_response_404 - 1);
-    if (written_len == -1) perror("error when writing error 404 response");
+    result = write_http_response(ctx->connect_fd, &ctx->written_len,
+                                 "404 Not Found",
+                                 sizeof "404 Not Found" - 1,
+                                 static_response_404,
+                                 sizeof static_response_404 - 1);
+    if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 1) printf("<- responded with 404\n");
     goto cleanup;
 
 cleanup:
-    free(buffer);
-    shutdown(connect_fd, SHUT_RDWR);
-    close(connect_fd);
+    cleanup_connection(ctx);
+    return 0;
+}
+
+void cleanup_connection(struct connection_ctx *ctx) {
+    free(ctx->buffer);
+    shutdown(ctx->connect_fd, SHUT_RDWR);
+    close(ctx->connect_fd);
 }
 
 #ifndef _WIN32
