@@ -170,13 +170,13 @@ int main(int argc, char **argv) {
     connections = NULL;
     USERS = NULL;
     USERS_LEN = 0;
-    POSTS = malloc(sizeof "foo;;;bar;;;qaz");
+    POSTS = malloc(1);
     if (POSTS == NULL) {
         perror("error allocating a single byte for posts");
         return 1;
     }
-    memcpy(POSTS, "foo;;;bar;;;qaz", sizeof "foo;;;bar;;;qaz");
-    POSTS_LEN = sizeof "foo;;;bar;;;qaz" - 1;
+    POSTS[0] = '\0';
+    POSTS_LEN = 0;
 
     /* The main listening loop. */
     while (!SERVER_TERMINATED) {
@@ -234,6 +234,8 @@ int main(int argc, char **argv) {
     WSACleanup();
 #endif
     free(connections);
+    free(POSTS);
+    free(USERS);
     printf_clear_line();
     printf("\rGood night!\n");
 
@@ -268,15 +270,18 @@ background-color:#EEEEE8;color:#222;\
 }\
 button{margin-top:8px;}\
 chatbox{display:flex;flex-direction:column-reverse;}\
+name{font-weight:bold;}\
+@keyframes f{from{opacity:0;}to{opacity:1;}}\
 post{\
 margin:0;padding:4px;\
 border-top:2px solid #DDD;\
+animation:f 0.2s;\
 }</style>\
 </head><body>\
 <form method=\"POST\" action=\"/post\">\
 <input type=\"text\" id=\"content\" name=\"content\" autofocus>\
 <br>\
-<button type=\"submit\">Post</button>\
+<button>Post</button>\
 </form><br>\
 <chatbox>\r\n";
 
@@ -425,6 +430,9 @@ static ssize_t write_chunk_terminator(int fd, size_t *written_len,
     return len;
 }
 
+static char post_head[] = "<post>";
+static char post_tail[] = "</post>";
+
 /* Returns 0 when the entire response has been sent.
  * This is separate from write_http_response because of the chat rendering. */
 static ssize_t write_http_chat_response(int fd, size_t *written_len,
@@ -474,20 +482,44 @@ static ssize_t write_http_chat_response(int fd, size_t *written_len,
                  posts_index > post_start)) {
                 /* Chunk length: 123\r\n */
                 section_start = target_len;
-                result = write_chunk_length(fd, posts_index - post_start,
+                result = write_chunk_length(fd,
+                                            posts_index - post_start +
+                                            sizeof post_head - 1 +
+                                            sizeof post_tail - 1,
                                             written_len, section_start);
                 if (result == -1) return -1;
                 target_len += result;
+
+                /* Post opening tag: */
+                section_start = target_len;
+                target_len += sizeof post_head - 1;
+                while (*written_len < target_len) {
+                    result = send(fd, &post_head[*written_len - section_start],
+                                  target_len - *written_len, 0);
+                    if (result == -1) return -1;
+                    else *written_len += result;
+                }
 
                 /* Write out this post: */
                 section_start = target_len;
                 target_len += posts_index - post_start;
                 while (*written_len < target_len) {
-                    result = send(fd, &POSTS[*written_len - (section_start - post_start)],
+                    result = send(fd, &POSTS[*written_len -
+                                             (section_start -post_start)],
                                   target_len - *written_len, 0);
                     if (result == -1) return -1;
                     else *written_len += result;
                     return -1;
+                }
+
+                /* Post closing tag: */
+                section_start = target_len;
+                target_len += sizeof post_tail - 1;
+                while (*written_len < target_len) {
+                    result = send(fd, &post_tail[*written_len - section_start],
+                                  target_len - *written_len, 0);
+                    if (result == -1) return -1;
+                    else *written_len += result;
                 }
 
                 /* Start reading from the next post. */
@@ -555,6 +587,50 @@ static int eq_ignore_whitespace(char *a, char *b) {
         counter_b++;
     }
     return 1;
+}
+
+static char name[] = "foo";
+static char name_len = 3;
+void add_new_post(char *buffer, size_t buffer_len) {
+    char tol_buf[64], c;
+    int i;
+
+    /* Skip over "content=" */
+    buffer_len -= 8;
+    if (buffer_len < 0) return;
+    buffer += 8;
+
+    /* Un-percent-encode */
+    for (i = 0; i < buffer_len; i++) {
+        if (buffer[i] == '+') buffer[i] = ' ';
+        else if (buffer[i] == '%' &&
+                 buffer[i + 1] != '\0' && buffer[i + 2] != '\0') {
+            tol_buf[0] = buffer[i + 1];
+            tol_buf[1] = buffer[i + 2];
+            tol_buf[2] = '\0';
+            c = (char)strtol(tol_buf, NULL, 16);
+            buffer[i] = c;
+            memmove(&buffer[i + 1], &buffer[i + 3], buffer_len - (i + 3));
+            buffer_len -= 2;
+            buffer[buffer_len] = '\0';
+        }
+    }
+
+    POSTS_LEN += sizeof "<name>[" - 1;
+    POSTS_LEN += name_len;
+    POSTS_LEN += sizeof "]: </name>" - 1;
+    POSTS_LEN += buffer_len;
+    POSTS_LEN += sizeof ";;;" - 1;
+    POSTS = realloc(POSTS, POSTS_LEN + 1);
+    if (POSTS == NULL) {
+        perror("error when expanding global post buffer");
+        exit(EXIT_FAILURE);
+    }
+    strcat(POSTS, "<name>");
+    strcat(POSTS, name);
+    strcat(POSTS, "</name>");
+    strcat(POSTS, buffer);
+    strcat(POSTS, ";;;");
 }
 
 
@@ -720,7 +796,10 @@ static int handle_connection(struct connection_ctx *ctx) {
             }
             else break;
         case RESOURCE_NEW_POST:
-            if (ctx->method == POST) goto respond_redirect_to_chat;
+            if (ctx->method == POST) {
+                add_new_post(ctx->buffer, ctx->expected_content_length);
+                goto respond_redirect_to_chat;
+            }
             else break;
         default:
             goto respond_404;
