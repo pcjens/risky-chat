@@ -22,8 +22,12 @@ is a really fun programming language to use.
 
 ## Building and running
 
-Requirements: a C compiler and a POSIX.1-2001 compliant system
-(e.g. Linux).
+Requirements:
+
+- a C compiler
+- one of the following:
+  - a POSIX.1-2001 compliant system (e.g. Linux, probably macOS)
+  - a system with winsock2 (e.g. Windows)
 
 Just compile [riskychat.c](riskychat.c) into an executable. Basic
 example:
@@ -57,11 +61,32 @@ Finally, compiling for Windows works too, simply run the following in
 a Developer Command Prompt (from a Visual Studio installation):
 
 ```batchfile
-# Build:
+REM Build:
 cl.exe /Feriskychat riskychat.c
-# Run:
+REM Run:
 riskychat.exe
 ```
+
+## Some notes
+
+Here's some general notes about the program, so you don't need to
+figure this out by reverse engineering or wading through the code:
+
+- Connection handling is very simple, there's no keep-alive, the TCP
+  connection is closed after delivering the response. This just made
+  the implementation simpler, but keep-alive could be added in without
+  too much effort.
+- The networking code uses [Berkeley
+  sockets](https://en.wikipedia.org/wiki/Berkeley_sockets) as
+  standardized by POSIX, but does not use
+  [select()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/select.html).
+  Instead, it just keeps calling
+  [accept()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/accept.html),
+  [recv()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/recv.html),
+  and
+  [send()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/send.html)
+  with a very short timeout (1 microsecond). Surprisingly enough, this
+  doesn't seem to hog the CPU that badly, at least on my system.
 
 ## License
 

@@ -25,9 +25,10 @@
  */
 
 #define _POSIX_C_SOURCE 200112L
-const char *RISKYCHAT_HOST = "127.0.0.1";
-const short RISKYCHAT_PORT = 8000;
-const int RISKYCHAT_VERBOSE = 1;
+#define RISKYCHAT_HOST "127.0.0.1"
+#define RISKYCHAT_PORT "8000"
+#define RISKYCHAT_VERBOSE 1
+#define RISKYCHAT_MAX_CONNECTIONS 1000
 
 #include <errno.h>
 #include <stdio.h>
@@ -48,6 +49,7 @@ typedef SSIZE_T ssize_t;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 /* Signals: */
 #include <signal.h>
@@ -77,21 +79,27 @@ struct connection_ctx {
     size_t expected_content_length;
 };
 
-int connect_socket(void);
+int connect_socket(char *addr, char *port);
 int handle_connection(struct connection_ctx *ctx);
 void cleanup_connection(struct connection_ctx *ctx);
+void remove_connection(struct connection_ctx **contexts,
+                       int *contexts_len, int i);
 #ifndef _WIN32
 void handle_terminate(int sig);
 #endif
 void printf_clear_line(void);
+void print_usage(char *program_name);
 
 
 /* main: The main function */
 
 static int SERVER_TERMINATED = 0;
-int main(void) {
-    int result, socket_fd, connect_fd;
-    struct connection_ctx ctx;
+int main(int argc, char **argv) {
+    int result, socket_fd, connect_fd, i;
+    int contexts_len, allocated_contexts_len;
+    size_t new_size;
+    char *addr, *port;
+    struct connection_ctx *contexts;
 
 #ifndef _WIN32
     struct sigaction sa;
@@ -107,52 +115,95 @@ int main(void) {
     }
 #endif
 
+    if (argc == 1) {
+        addr = RISKYCHAT_HOST;
+        port = RISKYCHAT_PORT;
+    } else if (argc == 3) {
+        addr = argv[1];
+        port = argv[2];
+    } else {
+        print_usage(argv[0]);
+        return 1;
+    }
+
     /* Creation of the TCP socket we will listen to HTTP connections on. */
-    socket_fd = connect_socket();
-    if (socket_fd == -1) { return 1; }
-    printf("Started the Risky Chat server on http://%s:%d.\n",
-           RISKYCHAT_HOST, RISKYCHAT_PORT);
+    socket_fd = connect_socket(addr, port);
+    if (socket_fd == -1) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    printf("Started the Risky Chat server on http://%s:%s.\n", addr, port);
 
 #ifndef _WIN32
     /* Setup interrupt handler. */
     sa.sa_handler = handle_terminate;
     sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask);
+    signal(SIGPIPE, SIG_IGN);
     if (sigaction(SIGINT, &sa, NULL) == -1) {
         perror("could not set up a handler for SIGINT");
     } else {
         printf(" (Interrupt with ctrl+c to close.)\n");
     }
     if (sigaction(SIGTERM, &sa, NULL) == -1) {
-        perror("could not set up a handle for SIGTERM");
+        perror("could not set up a handler for SIGTERM");
     }
 #endif
 
+    /* Let's not allocate anything before it's needed. */
+    allocated_contexts_len = 0;
+    contexts_len = 0;
+    contexts = NULL;
+
     /* The main listening loop. */
-    for (;;) {
-        connect_fd = accept(socket_fd, NULL, NULL);
-        if (SERVER_TERMINATED) break;
-        if (connect_fd != INVALID_SOCKET) {
-            memset(&ctx, 0, sizeof ctx);
-            ctx.connect_fd = connect_fd;
-            for (;;) {
-                result = handle_connection(&ctx);
-                if (result == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    perror("error while handling connection");
-                    cleanup_connection(&ctx);
-                    break;
-                } else if (result == 0) {
-                    break;
+    while (!SERVER_TERMINATED) {
+        if (contexts_len < RISKYCHAT_MAX_CONNECTIONS) {
+            connect_fd = accept(socket_fd, NULL, NULL);
+            if (connect_fd != INVALID_SOCKET) {
+                if (contexts_len == allocated_contexts_len) {
+                    allocated_contexts_len++;
+                    new_size = allocated_contexts_len * sizeof contexts[0];
+                    contexts = realloc(contexts, new_size);
+                    if (RISKYCHAT_VERBOSE >= 1) {
+                        printf("expanding contexts to %ld bytes\n", new_size);
+                    }
+                    if (contexts == NULL) {
+                        perror("could not allocate connection contexts");
+                        return 1;
+                    }
                 }
+
+                memset(&contexts[contexts_len], 0, sizeof contexts[contexts_len]);
+                contexts[contexts_len].connect_fd = connect_fd;
+                contexts_len++;
             }
         }
+
+        for (i = 0; i < contexts_len; i++) {
+            result = handle_connection(&contexts[i]);
+            if (result == 0) {
+                remove_connection(&contexts, &contexts_len, i);
+                i--;
+            } else if (result == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("error while handling connection");
+                cleanup_connection(&contexts[i]);
+                remove_connection(&contexts, &contexts_len, i);
+                i--;
+            }
+        }
+
+        fflush(stdout);
     }
 
     /* Resource cleanup. */
+    for (i = 0; i < contexts_len; i++) {
+        cleanup_connection(&contexts[i]);
+    }
     close(socket_fd);
 #ifdef _WIN32
     WSACleanup();
 #endif
+    free(contexts);
     printf_clear_line();
     printf("\rGood night!\n");
 
@@ -268,7 +319,8 @@ ssize_t write_http_response(int fd, size_t *written_len,
         else *written_len += result;
     }
 
-    buf_len = snprintf(buf, sizeof buf, "\r\nContent-Length: %d\r\n\r\n",
+    buf_len = snprintf(buf, sizeof buf,
+                       "\r\nConnection: close\r\nContent-Length: %ld\r\n\r\n",
                        response_len);
     section_start = target_len;
     target_len += buf_len;
@@ -294,9 +346,10 @@ ssize_t write_http_response(int fd, size_t *written_len,
 
 /* pubfuncs: Functions used in main(). */
 
-int connect_socket(void) {
+int connect_socket(char *addr, char *port) {
     int fd;
     struct sockaddr_in sa;
+    struct timeval timeout;
 
     fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd == INVALID_SOCKET) {
@@ -306,8 +359,8 @@ int connect_socket(void) {
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(RISKYCHAT_PORT);
-    sa.sin_addr.s_addr = inet_addr(RISKYCHAT_HOST);
+    sa.sin_port = htons(atoi(port));
+    sa.sin_addr.s_addr = inet_addr(addr);
     if (bind(fd, (struct sockaddr *)&sa, sizeof sa) == SOCKET_ERROR) {
         perror("binding to the address failed");
         return -1;
@@ -316,6 +369,17 @@ int connect_socket(void) {
     if (listen(fd, SOMAXCONN) == SOCKET_ERROR) {
         perror("listening to the socket failed");
         return -1;
+    }
+
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof timeout) == SOCKET_ERROR) {
+        perror("setting the socket recv timeout failed");
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                   &timeout, sizeof timeout) == SOCKET_ERROR) {
+        perror("setting the socket recv timeout failed");
     }
 
     return fd;
@@ -330,29 +394,29 @@ int handle_connection(struct connection_ctx *ctx) {
     switch (ctx->stage) {
     case 0:
         /* Read the status line. */
-        result = read_line(ctx->connect_fd, &ctx->buffer, &ctx->buffer_len,
-                           &ctx->read_len);
+        result = read_line(ctx->connect_fd, &ctx->buffer,
+                           &ctx->buffer_len, &ctx->read_len);
         if (result == -1) {
             return -1;
         }
         token = strtok(ctx->buffer, " ");
-        if (strcmp("GET", token) == 0) {
+        if (token != NULL && strcmp("GET", token) == 0) {
             ctx->method = GET;
-            if (RISKYCHAT_VERBOSE >= 1) printf("GET ");
-        } else if (strcmp("POST", token) == 0) {
+            if (RISKYCHAT_VERBOSE >= 2) printf("GET ");
+        } else if (token != NULL && strcmp("POST", token) == 0) {
             ctx->method = POST;
-            if (RISKYCHAT_VERBOSE >= 1) printf("POST ");
+            if (RISKYCHAT_VERBOSE >= 2) printf("POST ");
         } else {
             ctx->stage = 3;
             goto respond_400;
         }
         token = strtok(NULL, " ");
-        if (strcmp("/", token) == 0) {
+        if (token != NULL && strcmp("/", token) == 0) {
             ctx->requested_resource = RESOURCE_INDEX;
-            if (RISKYCHAT_VERBOSE >= 1) printf("/ ");
-        } else if (strcmp("/post", token) == 0) {
+            if (RISKYCHAT_VERBOSE >= 2) printf("/ ");
+        } else if (token != NULL && strcmp("/post", token) == 0) {
             ctx->requested_resource = RESOURCE_NEW_POST;
-            if (RISKYCHAT_VERBOSE >= 1) printf("/post ");
+            if (RISKYCHAT_VERBOSE >= 2) printf("/post ");
         }
 
         /* Reset the line length after processing the statusline. */
@@ -362,22 +426,22 @@ int handle_connection(struct connection_ctx *ctx) {
     case 1:
         /* Read the headers. */
         for (;;) {
-            result = read_line(ctx->connect_fd, &ctx->buffer, &ctx->buffer_len,
-                               &ctx->read_len);
+            result = read_line(ctx->connect_fd, &ctx->buffer,
+                               &ctx->buffer_len, &ctx->read_len);
             if (result == -1) {
                 return -1;
             }
 
             token = strtok(ctx->buffer, ":");
-            if (strcmp("Content-Length", token) == 0) {
+            if (token != NULL && strcmp("Content-Length", token) == 0) {
                 token = strtok(NULL, ":");
                 ctx->expected_content_length = atoi(token);
-                if (RISKYCHAT_VERBOSE >= 1)
+                if (RISKYCHAT_VERBOSE >= 2)
                     printf("(%ld) ", ctx->expected_content_length);
             }
 
             /* The end of the header section is marked by an empty line. */
-            if (ctx->read_len == 2 && strcmp("\r\n", ctx->buffer) == 0) {
+            if (ctx->buffer != NULL && strcmp("\r\n", ctx->buffer) == 0) {
                 ctx->read_len = 0;
                 break;
             }
@@ -390,7 +454,7 @@ int handle_connection(struct connection_ctx *ctx) {
     case 2:
         /* Read the body, when needed. */
         if (ctx->method == POST && ctx->expected_content_length > 0) {
-            if (RISKYCHAT_VERBOSE >= 1) printf("br");
+            if (RISKYCHAT_VERBOSE >= 2) printf("br");
             if (ctx->buffer_len < ctx->expected_content_length + 1) {
                 ctx->buffer_len = ctx->expected_content_length + 1;
                 ctx->buffer = realloc(ctx->buffer, ctx->buffer_len);
@@ -399,7 +463,6 @@ int handle_connection(struct connection_ctx *ctx) {
                     exit(EXIT_FAILURE);
                 }
             }
-            ctx->read_len = 0;
             while (ctx->read_len < ctx->expected_content_length) {
                 result = recv(ctx->connect_fd, &ctx->buffer[ctx->read_len],
                               ctx->expected_content_length, 0);
@@ -407,7 +470,7 @@ int handle_connection(struct connection_ctx *ctx) {
                 else ctx->read_len += result;
             }
             ctx->buffer[ctx->expected_content_length] = '\0';
-            if (RISKYCHAT_VERBOSE >= 1)
+            if (RISKYCHAT_VERBOSE >= 2)
                 printf("\b\b(%ld bytes read) ", ctx->expected_content_length);
         }
         ctx->read_len = 0;
@@ -436,7 +499,7 @@ respond_new_post:
         if (result == -1) return -1;
         else ctx->written_len += result;
     }
-    if (RISKYCHAT_VERBOSE >= 1) printf("<- post handled\n");
+    if (RISKYCHAT_VERBOSE >= 2) printf("<- post handled\n");
     goto cleanup;
 
 respond_index:
@@ -445,7 +508,7 @@ respond_index:
                                  static_response_index,
                                  sizeof static_response_index - 1);
     if (result == -1) return -1;
-    if (RISKYCHAT_VERBOSE >= 1) printf("<- responded with index\n");
+    if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with index\n");
     goto cleanup;
 
 respond_400:
@@ -455,7 +518,7 @@ respond_400:
                                  static_response_400,
                                  sizeof static_response_400 - 1);
     if (result == -1) return -1;
-    if (RISKYCHAT_VERBOSE >= 1) printf("<- responded with 400\n");
+    if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with 400\n");
     goto cleanup;
 
 respond_404:
@@ -465,7 +528,7 @@ respond_404:
                                  static_response_404,
                                  sizeof static_response_404 - 1);
     if (result == -1) return -1;
-    if (RISKYCHAT_VERBOSE >= 1) printf("<- responded with 404\n");
+    if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with 404\n");
     goto cleanup;
 
 cleanup:
@@ -477,6 +540,16 @@ void cleanup_connection(struct connection_ctx *ctx) {
     free(ctx->buffer);
     shutdown(ctx->connect_fd, SHUT_RDWR);
     close(ctx->connect_fd);
+}
+
+void remove_connection(struct connection_ctx **contexts,
+                       int *contexts_len, int i) {
+    if (i == *contexts_len - 1) {
+        (*contexts_len)--;
+    } else {
+        (*contexts)[i] = (*contexts)[*contexts_len - 1];
+        (*contexts_len)--;
+    }
 }
 
 #ifndef _WIN32
@@ -491,4 +564,9 @@ void printf_clear_line(void) {
     /* See "Clear entire line" here (it's a VT100 escape code):
      * https://espterm.github.io/docs/VT100%20escape%20codes.html */
     printf("%c[2K", 27);
+}
+
+void print_usage(char *program_name) {
+    fprintf(stderr, "Usage: %s [<address> <port>]\nExample: %s 127.0.0.1 8000\n",
+            program_name, program_name);
 }
