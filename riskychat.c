@@ -60,11 +60,11 @@ typedef SSIZE_T ssize_t;
 /* decls: Declarations used by the rest of the program. */
 
 enum http_method {
-    GET, POST /* Just the ones we care about. */
+    GET, POST, HEAD /* Just the ones we care about. */
 };
 
 enum resource {
-    UNKNOWN_RESOURCE, RESOURCE_INDEX, RESOURCE_NEW_POST
+    UNKNOWN_RESOURCE, RESOURCE_INDEX, RESOURCE_LOGIN, RESOURCE_NEW_POST
 };
 
 struct connection_ctx {
@@ -73,6 +73,7 @@ struct connection_ctx {
     size_t buffer_len;
     size_t read_len;
     size_t written_len;
+    int user_id;
     int stage;
     enum http_method method;
     enum resource requested_resource;
@@ -96,16 +97,17 @@ void print_usage(char *program_name);
 static int SERVER_TERMINATED = 0;
 int main(int argc, char **argv) {
     int result, socket_fd, connect_fd, i;
-    int contexts_len, allocated_contexts_len;
+    int connections_len, allocated_conns_len;
     size_t new_size;
     char *addr, *port;
-    struct connection_ctx *contexts;
+    struct connection_ctx *connections, *new_connections;
 
 #ifndef _WIN32
     struct sigaction sa;
 #endif
 
 #ifdef _WIN32
+    /* Winsock2 setup. */
     WSADATA wsaData;
 
     result = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -139,7 +141,7 @@ int main(int argc, char **argv) {
     sa.sa_handler = handle_terminate;
     sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask);
-    signal(SIGPIPE, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN); /* SIGPIPE kills the process by default. */
     if (sigaction(SIGINT, &sa, NULL) == -1) {
         perror("could not set up a handler for SIGINT");
     } else {
@@ -151,59 +153,66 @@ int main(int argc, char **argv) {
 #endif
 
     /* Let's not allocate anything before it's needed. */
-    allocated_contexts_len = 0;
-    contexts_len = 0;
-    contexts = NULL;
+    allocated_conns_len = 0;
+    connections_len = 0;
+    connections = NULL;
 
     /* The main listening loop. */
     while (!SERVER_TERMINATED) {
-        if (contexts_len < RISKYCHAT_MAX_CONNECTIONS) {
-            connect_fd = accept(socket_fd, NULL, NULL);
-            if (connect_fd != INVALID_SOCKET) {
-                if (contexts_len == allocated_contexts_len) {
-                    allocated_contexts_len++;
-                    new_size = allocated_contexts_len * sizeof contexts[0];
-                    contexts = realloc(contexts, new_size);
-                    if (RISKYCHAT_VERBOSE >= 1) {
-                        printf("expanding contexts to %ld bytes\n", new_size);
-                    }
-                    if (contexts == NULL) {
-                        perror("could not allocate connection contexts");
-                        return 1;
-                    }
-                }
+        fflush(stdout);
 
-                memset(&contexts[contexts_len], 0, sizeof contexts[contexts_len]);
-                contexts[contexts_len].connect_fd = connect_fd;
-                contexts_len++;
-            }
-        }
-
-        for (i = 0; i < contexts_len; i++) {
-            result = handle_connection(&contexts[i]);
+        for (i = 0; i < connections_len; i++) {
+            result = handle_connection(&connections[i]);
             if (result == 0) {
-                remove_connection(&contexts, &contexts_len, i);
+                remove_connection(&connections, &connections_len, i);
                 i--;
             } else if (result == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 perror("error while handling connection");
-                cleanup_connection(&contexts[i]);
-                remove_connection(&contexts, &contexts_len, i);
+                cleanup_connection(&connections[i]);
+                remove_connection(&connections, &connections_len, i);
                 i--;
             }
         }
 
-        fflush(stdout);
+        if (connections_len < RISKYCHAT_MAX_CONNECTIONS) {
+            connect_fd = accept(socket_fd, NULL, NULL);
+            if (connect_fd != INVALID_SOCKET) {
+                if (connections_len == allocated_conns_len) {
+                    allocated_conns_len++;
+                    new_size = allocated_conns_len * sizeof connections[0];
+                    new_connections = realloc(connections, new_size);
+                    if (new_connections == NULL) {
+                        perror("could not expand connection buffer");
+                        if (errno == ENOMEM) {
+                            continue;
+                        } else {
+                            return 1;
+                        }
+                    }
+                    connections = new_connections;
+                    if (RISKYCHAT_VERBOSE >= 1) {
+                        printf("connection buffer: %ld bytes\n", new_size);
+                    }
+                }
+
+                memset(&connections[connections_len], 0,
+                       sizeof connections[connections_len]);
+                connections[connections_len].connect_fd = connect_fd;
+                connections_len++;
+            }
+        }
     }
 
     /* Resource cleanup. */
-    for (i = 0; i < contexts_len; i++) {
-        cleanup_connection(&contexts[i]);
+    for (i = 0; i < connections_len; i++) {
+        cleanup_connection(&connections[i]);
     }
     close(socket_fd);
 #ifdef _WIN32
+    /* Winsock2 cleanup. */
     WSACleanup();
 #endif
-    free(contexts);
+    free(connections);
     printf_clear_line();
     printf("\rGood night!\n");
 
@@ -213,7 +222,24 @@ int main(int argc, char **argv) {
 
 /* responses: The static response bodies. */
 
-static char static_response_index[] = "\
+static char static_response_login[] = "\
+<!DOCTYPE html>\r\n\
+<html><head><meta charset=\"utf-8\"><title>Risky Chat</title>\
+<style>html{background-color:#EEEEE8;color:#222;}\
+body{width:250px;margin:auto;margin-top:3em;}\
+h3{text-align:center;}\
+input{width:100%;}\
+button{margin-top:8px;}\
+</style>\
+</head><body>\
+<h3>Login to Risky Chat</h3>\
+<form method=\"POST\" action=\"/login\">\
+<input type=\"text\" placeholder=\"Username\" id=\"name\" name=\"name\" autofocus>\
+<br>\
+<button type=\"submit\">Login</button>\
+</form></body></html>\r\n";
+
+static char static_response_chat[] = "\
 <!DOCTYPE html>\r\n\
 <html><head><meta charset=\"utf-8\"><title>Risky Chat</title>\
 <style>html{\
@@ -228,6 +254,7 @@ border-top:2px solid #DDD;\
 <form method=\"POST\" action=\"/post\"\
  onsubmit=\"submit(); reset(); return false;\">\
 <input type=\"text\" id=\"content\" name=\"content\" autofocus>\
+<br>\
 <button type=\"submit\">Post</button>\
 </form><br>\
 <chatbox><post>Example post</post></chatbox></body></html>\r\n";
@@ -243,10 +270,6 @@ static char static_response_404[] = "\
 </head><body>\r\n\
 <h2>404 Not Found</h2>\r\n\
 </body></html>\r\n";
-
-static char static_post_response_raw[] =  "HTTP/1.1 205 Reset Content\r\n\
-Content-Length: 0\r\n\
-\r\n";
 
 
 /* privfuncs: Functions used by the functions used in main(). */
@@ -296,7 +319,8 @@ static char http_response_head[] = "HTTP/1.1 ";
 /* Returns 0 when the entire response has been sent. */
 ssize_t write_http_response(int fd, size_t *written_len,
                             char *status, size_t status_len,
-                            char *response, size_t response_len) {
+                            char *response, size_t response_len,
+                            int is_head) {
     ssize_t result, target_len, section_start;
     char buf[64];
     int buf_len;
@@ -331,16 +355,32 @@ ssize_t write_http_response(int fd, size_t *written_len,
         else *written_len += result;
     }
 
-    section_start = target_len;
-    target_len += response_len;
-    while (*written_len < target_len) {
-        result = send(fd, &response[*written_len - section_start],
-                      target_len - *written_len, 0);
-        if (result == -1) return -1;
-        else *written_len += result;
+    if (!is_head) {
+        section_start = target_len;
+        target_len += response_len;
+        while (*written_len < target_len) {
+            result = send(fd, &response[*written_len - section_start],
+                          target_len - *written_len, 0);
+            if (result == -1) return -1;
+            else *written_len += result;
+        }
     }
 
     return 0;
+}
+
+/* Returns 1 if the strings are equal, 0 if not. */
+int eq_ignore_whitespace(char *a, char *b) {
+    int counter_a = 0, counter_b = 0;
+    while (a[counter_a] != '\0' && b[counter_b] != '\0') {
+        while (a[counter_a] == ' ') counter_a++;
+        while (b[counter_b] == ' ') counter_b++;
+        if (a[counter_a] != b[counter_b]) return 0;
+        if (a[counter_a] == '\0') break;
+        counter_a++;
+        counter_b++;
+    }
+    return 1;
 }
 
 
@@ -388,8 +428,8 @@ int connect_socket(char *addr, char *port) {
 /* Returns 0 when the connection is closed, -1 otherwise.
  * This should keep being called if the return value is -1. */
 int handle_connection(struct connection_ctx *ctx) {
-    ssize_t result, total_response_len;
-    char *token;
+    ssize_t result;
+    char *token, *key, *value;
 
     switch (ctx->stage) {
     case 0:
@@ -403,6 +443,9 @@ int handle_connection(struct connection_ctx *ctx) {
         if (token != NULL && strcmp("GET", token) == 0) {
             ctx->method = GET;
             if (RISKYCHAT_VERBOSE >= 2) printf("GET ");
+        } else if (token != NULL && strcmp("HEAD", token) == 0) {
+            ctx->method = HEAD;
+            if (RISKYCHAT_VERBOSE >= 2) printf("HEAD ");
         } else if (token != NULL && strcmp("POST", token) == 0) {
             ctx->method = POST;
             if (RISKYCHAT_VERBOSE >= 2) printf("POST ");
@@ -417,6 +460,12 @@ int handle_connection(struct connection_ctx *ctx) {
         } else if (token != NULL && strcmp("/post", token) == 0) {
             ctx->requested_resource = RESOURCE_NEW_POST;
             if (RISKYCHAT_VERBOSE >= 2) printf("/post ");
+        } else if (token != NULL && strcmp("/login", token) == 0) {
+            ctx->requested_resource = RESOURCE_LOGIN;
+            if (RISKYCHAT_VERBOSE >= 2) printf("/login ");
+        } else {
+            ctx->stage = 3;
+            goto respond_404;
         }
 
         /* Reset the line length after processing the statusline. */
@@ -438,6 +487,17 @@ int handle_connection(struct connection_ctx *ctx) {
                 ctx->expected_content_length = atoi(token);
                 if (RISKYCHAT_VERBOSE >= 2)
                     printf("(%ld) ", ctx->expected_content_length);
+            } else if (token != NULL && strcmp("Cookie", token) == 0) {
+                token = strtok(NULL, ":");
+                key = strtok(token, "=");
+                while (key != NULL) {
+                    value = strtok(NULL, ";");
+                    if (eq_ignore_whitespace("riskyid", key)) {
+                        ctx->user_id = atoi(value);
+                        break;
+                    }
+                    key = strtok(NULL, "=");
+                }
             }
 
             /* The end of the header section is marked by an empty line. */
@@ -480,7 +540,10 @@ int handle_connection(struct connection_ctx *ctx) {
         /* Respond. */
         switch (ctx->requested_resource) {
         case RESOURCE_INDEX:
-            if (ctx->method == GET) goto respond_index;
+            if (ctx->method == GET || ctx->method == HEAD) {
+                if (ctx->user_id == 0) goto respond_login;
+                else goto respond_chat;
+            }
             else break;
         case RESOURCE_NEW_POST:
             if (ctx->method == POST) goto respond_new_post;
@@ -492,23 +555,32 @@ int handle_connection(struct connection_ctx *ctx) {
     }
 
 respond_new_post:
-    total_response_len = sizeof static_post_response_raw - 1;
-    while (ctx->written_len < total_response_len) {
-        result = send(ctx->connect_fd, static_post_response_raw,
-                      total_response_len - ctx->written_len, 0);
-        if (result == -1) return -1;
-        else ctx->written_len += result;
-    }
+    result = write_http_response(ctx->connect_fd, &ctx->written_len,
+                                 "205 Reset Content",
+                                 sizeof "205 Reset Content" - 1,
+                                 "", 0, 0);
+    if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 2) printf("<- post handled\n");
     goto cleanup;
 
-respond_index:
+respond_login:
     result = write_http_response(ctx->connect_fd, &ctx->written_len,
                                  "200 OK", sizeof "200 OK" - 1,
-                                 static_response_index,
-                                 sizeof static_response_index - 1);
+                                 static_response_login,
+                                 sizeof static_response_login - 1,
+                                 ctx->method == HEAD);
     if (result == -1) return -1;
-    if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with index\n");
+    if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with login\n");
+    goto cleanup;
+
+respond_chat:
+    result = write_http_response(ctx->connect_fd, &ctx->written_len,
+                                 "200 OK", sizeof "200 OK" - 1,
+                                 static_response_chat,
+                                 sizeof static_response_chat - 1,
+                                 ctx->method == HEAD);
+    if (result == -1) return -1;
+    if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with chat\n");
     goto cleanup;
 
 respond_400:
@@ -516,7 +588,8 @@ respond_400:
                                  "400 Bad Request",
                                  sizeof "400 Bad Request" - 1,
                                  static_response_400,
-                                 sizeof static_response_400 - 1);
+                                 sizeof static_response_400 - 1,
+                                 ctx->method == HEAD);
     if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with 400\n");
     goto cleanup;
@@ -526,7 +599,8 @@ respond_404:
                                  "404 Not Found",
                                  sizeof "404 Not Found" - 1,
                                  static_response_404,
-                                 sizeof static_response_404 - 1);
+                                 sizeof static_response_404 - 1,
+                                 ctx->method == HEAD);
     if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with 404\n");
     goto cleanup;
@@ -542,13 +616,13 @@ void cleanup_connection(struct connection_ctx *ctx) {
     close(ctx->connect_fd);
 }
 
-void remove_connection(struct connection_ctx **contexts,
-                       int *contexts_len, int i) {
-    if (i == *contexts_len - 1) {
-        (*contexts_len)--;
+void remove_connection(struct connection_ctx **connections,
+                       int *connections_len, int i) {
+    if (i == *connections_len - 1) {
+        (*connections_len)--;
     } else {
-        (*contexts)[i] = (*contexts)[*contexts_len - 1];
-        (*contexts_len)--;
+        (*connections)[i] = (*connections)[*connections_len - 1];
+        (*connections_len)--;
     }
 }
 
