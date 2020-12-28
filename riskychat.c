@@ -31,11 +31,14 @@
 #define RISKYCHAT_PORT "8000"
 #define RISKYCHAT_VERBOSE 1
 #define RISKYCHAT_MAX_CONNECTIONS 1000
+#define RISKYCHAT_MAX_USERS 1000
+#define RISKYCHAT_TIMEOUT 300
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 /* ssize_t: */
@@ -169,7 +172,7 @@ int main(int argc, char **argv) {
     connections_len = 0;
     connections = NULL;
     USERS = NULL;
-    USERS_LEN = 0;
+    USERS_LEN = 1;
     POSTS = malloc(1);
     if (POSTS == NULL) {
         perror("error allocating a single byte for posts");
@@ -589,19 +592,10 @@ static int eq_ignore_whitespace(char *a, char *b) {
     return 1;
 }
 
-static char name[] = "foo";
-static char name_len = 3;
-void add_new_post(char *buffer, size_t buffer_len) {
+void decode_percent(char *buffer, size_t *buffer_len) {
     char tol_buf[64], c;
     int i;
-
-    /* Skip over "content=" */
-    buffer_len -= 8;
-    if (buffer_len < 0) return;
-    buffer += 8;
-
-    /* Un-percent-encode */
-    for (i = 0; i < buffer_len; i++) {
+    for (i = 0; i < *buffer_len; i++) {
         if (buffer[i] == '+') buffer[i] = ' ';
         else if (buffer[i] == '%' &&
                  buffer[i + 1] != '\0' && buffer[i + 2] != '\0') {
@@ -610,11 +604,31 @@ void add_new_post(char *buffer, size_t buffer_len) {
             tol_buf[2] = '\0';
             c = (char)strtol(tol_buf, NULL, 16);
             buffer[i] = c;
-            memmove(&buffer[i + 1], &buffer[i + 3], buffer_len - (i + 3));
-            buffer_len -= 2;
-            buffer[buffer_len] = '\0';
+            memmove(&buffer[i + 1], &buffer[i + 3], *buffer_len - (i + 3));
+            *buffer_len -= 2;
+            buffer[*buffer_len] = '\0';
         }
     }
+}
+
+void add_new_post(char *buffer, size_t buffer_len, int user_id) {
+    char *name;
+    int name_len;
+
+    if (user_id <= 0 || user_id >= USERS_LEN) {
+        return;
+    }
+
+    name = USERS[user_id].name;
+    name_len = strlen(name);
+
+    /* Skip over "content=" */
+    buffer_len -= 8;
+    if (buffer_len < 0) return;
+    buffer += 8;
+
+    /* Un-percent-encode */
+    decode_percent(buffer, &buffer_len);
 
     POSTS_LEN += sizeof "<name>[" - 1;
     POSTS_LEN += name_len;
@@ -626,11 +640,63 @@ void add_new_post(char *buffer, size_t buffer_len) {
         perror("error when expanding global post buffer");
         exit(EXIT_FAILURE);
     }
-    strcat(POSTS, "<name>");
+    strcat(POSTS, "<name>[");
     strcat(POSTS, name);
-    strcat(POSTS, "</name>");
+    strcat(POSTS, "]: </name>");
     strcat(POSTS, buffer);
     strcat(POSTS, ";;;");
+}
+
+int add_user(char *name) {
+    time_t t;
+    int i;
+
+    if (USERS_LEN >= RISKYCHAT_MAX_USERS) {
+        return 0;
+    } else {
+        t = time(NULL);
+        for (i = 1; i < USERS_LEN; i++) {
+            if (t - USERS[i].refresh_time > RISKYCHAT_TIMEOUT) {
+                USERS[i].refresh_time = t;
+                free(USERS[i].name);
+                USERS[i].name = name;
+                return i;
+            }
+        }
+        i = USERS_LEN++;
+        USERS = realloc(USERS, sizeof USERS[0] * USERS_LEN);
+        if (USERS == NULL) {
+            perror("error when allocating users");
+            exit(EXIT_FAILURE);
+        }
+        USERS[i].refresh_time = t;
+        USERS[i].name = name;
+        return i;
+    }
+}
+
+int is_expired_user(int user_id) {
+    if (user_id <= 0 || user_id >= USERS_LEN) {
+        return 1;
+    }
+    return time(NULL) - USERS[user_id].refresh_time > RISKYCHAT_TIMEOUT;
+}
+
+int is_name_reserved(char *name) {
+    int i;
+    for (i = 1; i < USERS_LEN; i++) {
+        if (time(NULL) - USERS[i].refresh_time <= RISKYCHAT_TIMEOUT &&
+            strcmp(USERS[i].name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void refresh_user(int user_id) {
+    if (user_id > 0 && user_id < USERS_LEN) {
+        USERS[user_id].refresh_time = time(NULL);
+    }
 }
 
 
@@ -678,8 +744,9 @@ static int connect_socket(char *addr, char *port) {
 /* Returns 0 when the connection is closed, -1 otherwise.
  * This should keep being called if the return value is -1. */
 static int handle_connection(struct connection_ctx *ctx) {
-    ssize_t result;
-    char *token, *key, *value;
+    ssize_t result, name_len;
+    char buf[128];
+    char *token, *key, *value, *name;
 
     switch (ctx->stage) {
     case 0:
@@ -783,7 +850,6 @@ static int handle_connection(struct connection_ctx *ctx) {
             if (RISKYCHAT_VERBOSE >= 2)
                 printf("\b\b(%ld bytes read) ", ctx->expected_content_length);
         }
-        ctx->read_len = 0;
         ctx->stage++;
 
     case 3:
@@ -791,16 +857,37 @@ static int handle_connection(struct connection_ctx *ctx) {
         switch (ctx->requested_resource) {
         case RESOURCE_INDEX:
             if (ctx->method == GET || ctx->method == HEAD) {
-                if (ctx->user_id == 0) goto respond_chat;
-                else goto respond_login;
-            }
-            else break;
+                if (ctx->user_id == 0 || is_expired_user(ctx->user_id))
+                    goto respond_login;
+                else goto respond_chat;
+            } else break;
         case RESOURCE_NEW_POST:
             if (ctx->method == POST) {
-                add_new_post(ctx->buffer, ctx->expected_content_length);
+                add_new_post(ctx->buffer, ctx->expected_content_length,
+                             ctx->user_id);
+                refresh_user(ctx->user_id);
                 goto respond_redirect_to_chat;
-            }
-            else break;
+            } else break;
+        case RESOURCE_LOGIN:
+            if (ctx->method == POST) {
+                if (ctx->user_id == 0 || is_expired_user(ctx->user_id)) {
+                    decode_percent(ctx->buffer, &ctx->read_len);
+                    name_len = strlen(ctx->buffer) - 5;
+                    name = malloc(name_len + 1);
+                    if (name == NULL) {
+                        perror("error when allocating name");
+                        exit(EXIT_FAILURE);
+                    }
+                    memcpy(name, &ctx->buffer[5], name_len);
+                    name[name_len] = '\0';
+                    if (is_name_reserved(name)) {
+                        goto respond_login;
+                    } else {
+                        ctx->user_id = add_user(name);
+                    }
+                }
+                goto respond_add_user;
+            } else break;
         default:
             goto respond_404;
         }
@@ -822,6 +909,16 @@ respond_redirect_to_chat:
                                  "303 See Other", sizeof "303 See Other" - 1,
                                  "", 0, ctx->method == HEAD,
                                  "Location: /\r\n");
+    if (result == -1) return -1;
+    if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with login\n");
+    goto cleanup;
+
+respond_add_user:
+    snprintf(buf, sizeof buf, "Location: /\r\nSet-Cookie: riskyid=%d\r\n",
+             ctx->user_id);
+    result = write_http_response(ctx->connect_fd, &ctx->written_len,
+                                 "303 See Other", sizeof "303 See Other" - 1,
+                                 "", 0, ctx->method == HEAD, buf);
     if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with login\n");
     goto cleanup;
