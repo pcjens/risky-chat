@@ -190,8 +190,18 @@ int main(int argc, char **argv) {
             if (result == 0) {
                 remove_connection(&connections, &connections_len, i);
                 i--;
-            } else if (result == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            } else if (result == -1 &&
+#ifdef _WIN32
+                       WSAGetLastError() != 0 && WSAGetLastError() != WSAEWOULDBLOCK
+#else
+                       errno != EAGAIN && errno != EWOULDBLOCK
+#endif
+                ) {
+#ifdef _WIN32
+                fprintf(stderr, "error while handling connection: %d\n", WSAGetLastError());
+#else
                 perror("error while handling connection");
+#endif
                 cleanup_connection(&connections[i]);
                 remove_connection(&connections, &connections_len, i);
                 i--;
@@ -512,7 +522,6 @@ static ssize_t write_http_chat_response(int fd, size_t *written_len,
                                   target_len - *written_len, 0);
                     if (result == -1) return -1;
                     else *written_len += result;
-                    return -1;
                 }
 
                 /* Post closing tag: */
