@@ -87,6 +87,9 @@ figure this out by reverse engineering or wading through the code:
   [send()](https://pubs.opengroup.org/onlinepubs/9699919799/functions/send.html)
   with a very short timeout (1 microsecond). Surprisingly enough, this
   doesn't seem to hog the CPU that badly, at least on my system.
+- For some reason, SIGPIPEs seem to be prevalent. I don't know why, but I
+  didn't have time to fix them either. The server probably closes the
+  socket too soon in some cases.
 
 ## License
 

@@ -22,6 +22,8 @@
  *   Search the text inbetween the quotes to find the section.
  * - The code should compile on any system which supports the POSIX socket API
  *   and has a C89 compiler.
+ * - Do not use this as reference! It is bad, hastily written code!
+ *   Especially the HTTP parsing and writing parts!!
  */
 
 #define _POSIX_C_SOURCE 200112L
@@ -80,21 +82,31 @@ struct connection_ctx {
     size_t expected_content_length;
 };
 
-int connect_socket(char *addr, char *port);
-int handle_connection(struct connection_ctx *ctx);
-void cleanup_connection(struct connection_ctx *ctx);
-void remove_connection(struct connection_ctx **contexts,
+struct user {
+    char *name;
+    time_t refresh_time;
+};
+
+static int connect_socket(char *addr, char *port);
+static int handle_connection(struct connection_ctx *ctx);
+static void cleanup_connection(struct connection_ctx *ctx);
+static void remove_connection(struct connection_ctx **contexts,
                        int *contexts_len, int i);
 #ifndef _WIN32
-void handle_terminate(int sig);
+static void handle_terminate(int sig);
 #endif
-void printf_clear_line(void);
-void print_usage(char *program_name);
+static void printf_clear_line(void);
+static void print_usage(char *program_name);
 
 
 /* main: The main function */
 
 static int SERVER_TERMINATED = 0;
+static struct user *USERS;
+static int USERS_LEN;
+static char *POSTS;
+static int POSTS_LEN;
+
 int main(int argc, char **argv) {
     int result, socket_fd, connect_fd, i;
     int connections_len, allocated_conns_len;
@@ -156,6 +168,15 @@ int main(int argc, char **argv) {
     allocated_conns_len = 0;
     connections_len = 0;
     connections = NULL;
+    USERS = NULL;
+    USERS_LEN = 0;
+    POSTS = malloc(sizeof "foo;;;bar;;;qaz");
+    if (POSTS == NULL) {
+        perror("error allocating a single byte for posts");
+        return 1;
+    }
+    memcpy(POSTS, "foo;;;bar;;;qaz", sizeof "foo;;;bar;;;qaz");
+    POSTS_LEN = sizeof "foo;;;bar;;;qaz" - 1;
 
     /* The main listening loop. */
     while (!SERVER_TERMINATED) {
@@ -239,25 +260,27 @@ button{margin-top:8px;}\
 <button type=\"submit\">Login</button>\
 </form></body></html>\r\n";
 
-static char static_response_chat[] = "\
+static char static_response_chat_head[] = "\
 <!DOCTYPE html>\r\n\
 <html><head><meta charset=\"utf-8\"><title>Risky Chat</title>\
 <style>html{\
 background-color:#EEEEE8;color:#222;\
 }\
+button{margin-top:8px;}\
 chatbox{display:flex;flex-direction:column-reverse;}\
 post{\
 margin:0;padding:4px;\
 border-top:2px solid #DDD;\
 }</style>\
 </head><body>\
-<form method=\"POST\" action=\"/post\"\
- onsubmit=\"submit(); reset(); return false;\">\
+<form method=\"POST\" action=\"/post\">\
 <input type=\"text\" id=\"content\" name=\"content\" autofocus>\
 <br>\
 <button type=\"submit\">Post</button>\
 </form><br>\
-<chatbox><post>Example post</post></chatbox></body></html>\r\n";
+<chatbox>\r\n";
+
+static char static_response_chat_tail[] = "</chatbox></body></html>\r\n";
 
 static char static_response_400[] = "\
 400 Bad Request\r\n";
@@ -277,7 +300,8 @@ static char static_response_404[] = "\
 /* Reads from the given file descriptor, until a newline (LF) is encountered.
  * The return value is 0 if a line was read in entirety, -1 if not.
  * This should keep getting called until it returns 0 to get the entire line. */
-ssize_t read_line(int fd, char **buffer, size_t *buffer_len, size_t *string_len) {
+static ssize_t read_line(int fd, char **buffer, size_t *buffer_len,
+                         size_t *string_len) {
     ssize_t read_bytes = 0;
 
     for (;;) {
@@ -317,12 +341,12 @@ ssize_t read_line(int fd, char **buffer, size_t *buffer_len, size_t *string_len)
 
 static char http_response_head[] = "HTTP/1.1 ";
 /* Returns 0 when the entire response has been sent. */
-ssize_t write_http_response(int fd, size_t *written_len,
-                            char *status, size_t status_len,
-                            char *response, size_t response_len,
-                            int is_head) {
+static ssize_t write_http_response(int fd, size_t *written_len,
+                                   char *status, size_t status_len,
+                                   char *response, size_t response_len,
+                                   int is_head, char *additional_headers) {
     ssize_t result, target_len, section_start;
-    char buf[64];
+    char buf[128];
     int buf_len;
 
     section_start = 0;
@@ -344,8 +368,8 @@ ssize_t write_http_response(int fd, size_t *written_len,
     }
 
     buf_len = snprintf(buf, sizeof buf,
-                       "\r\nConnection: close\r\nContent-Length: %ld\r\n\r\n",
-                       response_len);
+                       "\r\nConnection: close\r\nContent-Length: %ld\r\n%s\r\n",
+                       response_len, additional_headers);
     section_start = target_len;
     target_len += buf_len;
     while (*written_len < target_len) {
@@ -369,8 +393,158 @@ ssize_t write_http_response(int fd, size_t *written_len,
     return 0;
 }
 
+static char chat_head_raw[] = "\
+HTTP/1.1 200 OK\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n";
+static ssize_t write_chunk_length(int fd, size_t len,
+                                  size_t *written_len, size_t start) {
+    int buf_len, result;
+    char buf[16];
+    buf_len = snprintf(buf, sizeof buf, "%lx\r\n", len);
+    while (*written_len < start + buf_len) {
+        result = send(fd, &buf[*written_len - start],
+                      start + buf_len - *written_len, 0);
+        if (result == -1) return -1;
+        else *written_len += result;
+    }
+    return buf_len;
+}
+
+static char chunk_terminator[] = "\r\n";
+static ssize_t write_chunk_terminator(int fd, size_t *written_len,
+                                      size_t start) {
+    int len, result;
+    len = sizeof chunk_terminator - 1;
+    while (*written_len < start + len) {
+        result = send(fd, &chunk_terminator[*written_len - start],
+                      start + len - *written_len, 0);
+        if (result == -1) return -1;
+        else *written_len += result;
+    }
+    return len;
+}
+
+/* Returns 0 when the entire response has been sent.
+ * This is separate from write_http_response because of the chat rendering. */
+static ssize_t write_http_chat_response(int fd, size_t *written_len,
+                                        int is_head) {
+    ssize_t result, section_start, target_len, posts_index, post_start;
+
+    section_start = 0;
+    target_len = sizeof chat_head_raw - 1;
+    while (*written_len < target_len) {
+        result = send(fd, &chat_head_raw[*written_len - section_start],
+                      target_len - *written_len, 0);
+        if (result == -1) return -1;
+        else *written_len += result;
+    }
+
+    if (!is_head) {
+        /* Chunk length: 123\r\n */
+        section_start = target_len;
+        result = write_chunk_length(fd, sizeof static_response_chat_head - 1,
+                                    written_len, section_start);
+        if (result == -1) return -1;
+        target_len += result;
+
+        /* Chunk body: ... */
+        section_start = target_len;
+        target_len += sizeof static_response_chat_head - 1;
+        while (*written_len < target_len) {
+            result = send(fd, &static_response_chat_head[*written_len -
+                                                         section_start],
+                          target_len - *written_len, 0);
+            if (result == -1) return -1;
+            else *written_len += result;
+        }
+
+        /* Chunk terminator: \r\n */
+        section_start = target_len;
+        result = write_chunk_terminator(fd, written_len, section_start);
+        if (result == -1) return -1;
+        target_len += result;
+
+        post_start = 0;
+        for (posts_index = post_start; posts_index <= POSTS_LEN; posts_index++) {
+            if (posts_index == POSTS_LEN ||
+                (POSTS[posts_index] == ';' &&
+                 POSTS[posts_index + 1] == ';' &&
+                 POSTS[posts_index + 2] == ';' &&
+                 posts_index > post_start)) {
+                /* Chunk length: 123\r\n */
+                section_start = target_len;
+                result = write_chunk_length(fd, posts_index - post_start,
+                                            written_len, section_start);
+                if (result == -1) return -1;
+                target_len += result;
+
+                /* Write out this post: */
+                section_start = target_len;
+                target_len += posts_index - post_start;
+                while (*written_len < target_len) {
+                    result = send(fd, &POSTS[*written_len - (section_start - post_start)],
+                                  target_len - *written_len, 0);
+                    if (result == -1) return -1;
+                    else *written_len += result;
+                    return -1;
+                }
+
+                /* Start reading from the next post. */
+                posts_index += 3;
+                post_start = posts_index;
+
+                /* Chunk terminator: \r\n */
+                section_start = target_len;
+                result = write_chunk_terminator(fd, written_len, section_start);
+                if (result == -1) return -1;
+                target_len += result;
+            }
+        }
+
+        /* Chunk length: 123\r\n */
+        section_start = target_len;
+        result = write_chunk_length(fd, sizeof static_response_chat_tail - 1,
+                                    written_len, section_start);
+        if (result == -1) return -1;
+        target_len += result;
+
+        /* Chunk body: ... */
+        section_start = target_len;
+        target_len += sizeof static_response_chat_tail - 1;
+        while (*written_len < target_len) {
+            result = send(fd, &static_response_chat_tail[*written_len -
+                                                         section_start],
+                          target_len - *written_len, 0);
+            if (result == -1) return -1;
+            else *written_len += result;
+            return -1;
+        }
+
+        /* Chunk terminator: \r\n */
+        section_start = target_len;
+        result = write_chunk_terminator(fd, written_len, section_start);
+        if (result == -1) return -1;
+        target_len += result;
+
+        /* Chunk length: 0\r\n */
+        section_start = target_len;
+        result = write_chunk_length(fd, 0, written_len, section_start);
+        if (result == -1) return -1;
+        target_len += result;
+
+        /* Chunk terminator: \r\n */
+        section_start = target_len;
+        result = write_chunk_terminator(fd, written_len, section_start);
+        if (result == -1) return -1;
+        target_len += result;
+    }
+
+    return 0;
+}
+
 /* Returns 1 if the strings are equal, 0 if not. */
-int eq_ignore_whitespace(char *a, char *b) {
+static int eq_ignore_whitespace(char *a, char *b) {
     int counter_a = 0, counter_b = 0;
     while (a[counter_a] != '\0' && b[counter_b] != '\0') {
         while (a[counter_a] == ' ') counter_a++;
@@ -386,7 +560,7 @@ int eq_ignore_whitespace(char *a, char *b) {
 
 /* pubfuncs: Functions used in main(). */
 
-int connect_socket(char *addr, char *port) {
+static int connect_socket(char *addr, char *port) {
     int fd;
     struct sockaddr_in sa;
     struct timeval timeout;
@@ -427,7 +601,7 @@ int connect_socket(char *addr, char *port) {
 
 /* Returns 0 when the connection is closed, -1 otherwise.
  * This should keep being called if the return value is -1. */
-int handle_connection(struct connection_ctx *ctx) {
+static int handle_connection(struct connection_ctx *ctx) {
     ssize_t result;
     char *token, *key, *value;
 
@@ -541,12 +715,12 @@ int handle_connection(struct connection_ctx *ctx) {
         switch (ctx->requested_resource) {
         case RESOURCE_INDEX:
             if (ctx->method == GET || ctx->method == HEAD) {
-                if (ctx->user_id == 0) goto respond_login;
-                else goto respond_chat;
+                if (ctx->user_id == 0) goto respond_chat;
+                else goto respond_login;
             }
             else break;
         case RESOURCE_NEW_POST:
-            if (ctx->method == POST) goto respond_new_post;
+            if (ctx->method == POST) goto respond_redirect_to_chat;
             else break;
         default:
             goto respond_404;
@@ -554,31 +728,28 @@ int handle_connection(struct connection_ctx *ctx) {
         goto respond_400;
     }
 
-respond_new_post:
-    result = write_http_response(ctx->connect_fd, &ctx->written_len,
-                                 "205 Reset Content",
-                                 sizeof "205 Reset Content" - 1,
-                                 "", 0, 0);
-    if (result == -1) return -1;
-    if (RISKYCHAT_VERBOSE >= 2) printf("<- post handled\n");
-    goto cleanup;
-
 respond_login:
     result = write_http_response(ctx->connect_fd, &ctx->written_len,
                                  "200 OK", sizeof "200 OK" - 1,
                                  static_response_login,
                                  sizeof static_response_login - 1,
-                                 ctx->method == HEAD);
+                                 ctx->method == HEAD, "");
+    if (result == -1) return -1;
+    if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with login\n");
+    goto cleanup;
+
+respond_redirect_to_chat:
+    result = write_http_response(ctx->connect_fd, &ctx->written_len,
+                                 "303 See Other", sizeof "303 See Other" - 1,
+                                 "", 0, ctx->method == HEAD,
+                                 "Location: /\r\n");
     if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with login\n");
     goto cleanup;
 
 respond_chat:
-    result = write_http_response(ctx->connect_fd, &ctx->written_len,
-                                 "200 OK", sizeof "200 OK" - 1,
-                                 static_response_chat,
-                                 sizeof static_response_chat - 1,
-                                 ctx->method == HEAD);
+    result = write_http_chat_response(ctx->connect_fd, &ctx->written_len,
+                                      ctx->method == HEAD);
     if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with chat\n");
     goto cleanup;
@@ -589,7 +760,7 @@ respond_400:
                                  sizeof "400 Bad Request" - 1,
                                  static_response_400,
                                  sizeof static_response_400 - 1,
-                                 ctx->method == HEAD);
+                                 ctx->method == HEAD, "");
     if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with 400\n");
     goto cleanup;
@@ -600,7 +771,7 @@ respond_404:
                                  sizeof "404 Not Found" - 1,
                                  static_response_404,
                                  sizeof static_response_404 - 1,
-                                 ctx->method == HEAD);
+                                 ctx->method == HEAD, "");
     if (result == -1) return -1;
     if (RISKYCHAT_VERBOSE >= 2) printf("<- responded with 404\n");
     goto cleanup;
@@ -610,13 +781,13 @@ cleanup:
     return 0;
 }
 
-void cleanup_connection(struct connection_ctx *ctx) {
+static void cleanup_connection(struct connection_ctx *ctx) {
     free(ctx->buffer);
     shutdown(ctx->connect_fd, SHUT_RDWR);
     close(ctx->connect_fd);
 }
 
-void remove_connection(struct connection_ctx **connections,
+static void remove_connection(struct connection_ctx **connections,
                        int *connections_len, int i) {
     if (i == *connections_len - 1) {
         (*connections_len)--;
@@ -627,20 +798,20 @@ void remove_connection(struct connection_ctx **connections,
 }
 
 #ifndef _WIN32
-void handle_terminate(int sig) {
+static void handle_terminate(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
         SERVER_TERMINATED = 1;
     }
 }
 #endif
 
-void printf_clear_line(void) {
+static void printf_clear_line(void) {
     /* See "Clear entire line" here (it's a VT100 escape code):
      * https://espterm.github.io/docs/VT100%20escape%20codes.html */
     printf("%c[2K", 27);
 }
 
-void print_usage(char *program_name) {
+static void print_usage(char *program_name) {
     fprintf(stderr, "Usage: %s [<address> <port>]\nExample: %s 127.0.0.1 8000\n",
             program_name, program_name);
 }
